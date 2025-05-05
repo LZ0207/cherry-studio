@@ -355,44 +355,72 @@ export default class OpenAIProvider extends BaseProvider {
    * @param onFilterMessages - The onFilterMessages callback
    * @returns The completions
    */
+  /**
+   * 生成对话完成结果，支持流式输出、思考内容处理、工具调用和网络搜索等功能。
+   *
+   * @param {CompletionsParams} params - 包含消息、助手、MCP工具、回调函数等参数的对象。
+   * @returns {Promise<void>} 一个Promise，在完成处理后解析。
+   */
   async completions({ messages, assistant, mcpTools, onChunk, onFilterMessages }: CompletionsParams): Promise<void> {
+    // 如果助手启用了生成图片功能，则调用生成图片的方法
     if (assistant.enableGenerateImage) {
       await this.generateImageByChat({ messages, assistant, onChunk } as CompletionsParams)
       return
     }
+    // 获取默认模型
     const defaultModel = getDefaultModel()
+    // 若助手有指定模型则使用，否则使用默认模型
     const model = assistant.model || defaultModel
+    // 从助手设置中获取上下文数量、最大令牌数和是否启用流式输出
     const { contextCount, maxTokens, streamOutput } = getAssistantSettings(assistant)
+    // 检查是否启用了网络搜索
     const isEnabledWebSearch = assistant.enableWebSearch || !!assistant.webSearchProviderId
+    // 将图片文件添加到消息内容中
     messages = addImageFileToContents(messages)
+    // 初始化系统消息
     let systemMessage = { role: 'system', content: assistant.prompt || '' }
+    // 如果是支持推理的OpenAI模型，修改系统消息的角色和内容
     if (isSupportedReasoningEffortOpenAIModel(model)) {
       systemMessage = {
         role: 'developer',
         content: `Formatting re-enabled${systemMessage ? '\n' + systemMessage.content : ''}`
       }
     }
+    // 如果存在MCP工具，构建系统提示
     if (mcpTools && mcpTools.length > 0) {
       systemMessage.content = buildSystemPrompt(systemMessage.content || '', mcpTools)
     }
 
+    // 初始化用户消息数组
     const userMessages: ChatCompletionMessageParam[] = []
+    // 过滤消息，包括空消息、上下文消息和以用户角色开头的消息
     const _messages = filterUserRoleStartMessages(
       filterEmptyMessages(filterContextMessages(takeRight(messages, contextCount + 1)))
     )
 
+    // 调用过滤消息的回调函数
     onFilterMessages(_messages)
 
+    // 将每条消息转换为符合OpenAI API要求的消息参数
     for (const message of _messages) {
       userMessages.push(await this.getMessageParam(message, model))
     }
 
+    // 检查是否支持流式输出
     const isSupportStreamOutput = () => {
       return streamOutput
     }
 
+    // 标记是否有推理内容
     let hasReasoningContent = false
+    // 存储上一个chunk的内容
     let lastChunk = ''
+    /**
+     * 检查推理是否结束
+     *
+     * @param {OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta & { reasoning_content?: string; reasoning?: string; thinking?: string }} delta - 响应的增量内容
+     * @returns {boolean} 如果推理结束返回true，否则返回false
+     */
     const isReasoningJustDone = (
       delta: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
         reasoning_content?: string
@@ -424,9 +452,13 @@ export default class OpenAIProvider extends BaseProvider {
       return false
     }
 
+    // 记录第一个token的时间
     let time_first_token_millsec = 0
+    // 记录第一个token的时间差
     let time_first_token_millsec_delta = 0
+    // 记录第一个内容的时间
     let time_first_content_millsec = 0
+    // 记录开始时间
     const start_time_millsec = new Date().getTime()
     console.log(
       `completions start_time_millsec ${new Date(start_time_millsec).toLocaleString(undefined, {
@@ -439,12 +471,16 @@ export default class OpenAIProvider extends BaseProvider {
         fractionalSecondDigits: 3
       })}`
     )
+    // 找到最后一条用户消息
     const lastUserMessage = _messages.findLast((m) => m.role === 'user')
+    // 创建中止控制器
     const { abortController, cleanup, signalPromise } = this.createAbortController(lastUserMessage?.id, true)
+    // 获取信号
     const { signal } = abortController
+    // 检查是否为Copilot并更新API密钥
     await this.checkIsCopilot()
 
-    //当 systemMessage 内容为空时不发送 systemMessage
+    // 当 systemMessage 内容为空时不发送 systemMessage
     let reqMessages: ChatCompletionMessageParam[]
     if (!systemMessage.content) {
       reqMessages = [...userMessages]
@@ -452,9 +488,18 @@ export default class OpenAIProvider extends BaseProvider {
       reqMessages = [systemMessage, ...userMessages].filter(Boolean) as ChatCompletionMessageParam[]
     }
 
+    // 存储MCP工具响应
     const toolResponses: MCPToolResponse[] = []
 
+    /**
+     * 处理工具调用
+     *
+     * @param {string} content - 消息内容
+     * @param {number} idx - 调用索引
+     * @returns {Promise<void>} 一个Promise，在处理完成后解析。
+     */
     const processToolUses = async (content: string, idx: number) => {
+      // 解析并调用工具
       const toolResults = await parseAndCallTools(
         content,
         toolResponses,
@@ -466,15 +511,19 @@ export default class OpenAIProvider extends BaseProvider {
       )
 
       if (toolResults.length > 0) {
+        // 将助手消息添加到请求消息中
         reqMessages.push({
           role: 'assistant',
           content: content
         } as ChatCompletionMessageParam)
+        // 将工具调用结果添加到请求消息中
         toolResults.forEach((ts) => reqMessages.push(ts as ChatCompletionMessageParam))
 
         console.debug('[tool] reqMessages before processing', model.id, reqMessages)
+        // 处理请求消息
         reqMessages = processReqMessages(model, reqMessages)
         console.debug('[tool] reqMessages', model.id, reqMessages)
+        // 发起新的流式请求
         const newStream = await this.sdk.chat.completions
           // @ts-ignore key is not typed
           .create(
@@ -496,57 +545,73 @@ export default class OpenAIProvider extends BaseProvider {
               signal
             }
           )
+        // 处理新的流
         await processStream(newStream, idx + 1)
       }
     }
 
+    /**
+     * 处理流式响应
+     *
+     * @param {any} stream - 流式响应
+     * @param {number} idx - 调用索引
+     * @returns {Promise<void>} 一个Promise，在处理完成后解析。
+     */
     const processStream = async (stream: any, idx: number) => {
-      // Handle non-streaming case (already returns early, no change needed here)
+      // 处理非流式情况
       if (!isSupportStreamOutput()) {
         const time_completion_millsec = new Date().getTime() - start_time_millsec
-        // Calculate final metrics once
+        // 计算最终指标
         const finalMetrics = {
           completion_tokens: stream.usage?.completion_tokens,
           time_completion_millsec,
-          time_first_token_millsec: 0 // Non-streaming, first token time is not relevant
+          time_first_token_millsec: 0 // 非流式，第一个token时间无关紧要
         }
 
-        // Create a synthetic usage object if stream.usage is undefined
+        // 创建一个合成的usage对象，如果stream.usage未定义
         const finalUsage = stream.usage
-        // Separate onChunk calls for text and usage/metrics
+        // 分别调用onChunk处理文本和usage/metrics
         if (stream.choices[0].message?.content) {
           onChunk({ type: ChunkType.TEXT_COMPLETE, text: stream.choices[0].message.content })
         }
 
-        // Always send usage and metrics data
+        // 始终发送usage和metrics数据
         onChunk({ type: ChunkType.BLOCK_COMPLETE, response: { usage: finalUsage, metrics: finalMetrics } })
         return
       }
 
-      let content = '' // Accumulate content for tool processing if needed
+      // 累积内容用于工具处理
+      let content = ''
+      // 累积思考内容
       let thinkingContent = ''
       // 记录最终的完成时间差
       let final_time_completion_millsec_delta = 0
+      // 记录最终的思考时间差
       let final_time_thinking_millsec_delta = 0
-      // Variable to store the last received usage object
+      // 存储最后收到的usage对象
       let lastUsage: Usage | undefined = undefined
-      // let isThinkingInContent: ThoughtProcessor | undefined = undefined
-      // const processThinkingChunk = this.handleThinkingTags()
+      // 标记是否为第一个chunk
       let isFirstChunk = true
+      // 标记是否为第一个思考chunk
       let isFirstThinkingChunk = true
+      // 遍历流式响应
       for await (const chunk of stream) {
+        // 如果聊天完成被暂停，则退出循环
         if (window.keyv.get(EVENT_NAMES.CHAT_COMPLETION_PAUSED)) {
           break
         }
 
+        // 获取响应的增量内容
         const delta = chunk.choices[0]?.delta
+        // 获取完成原因
         const finishReason = chunk.choices[0]?.finish_reason
 
-        // --- Incremental onChunk calls ---
+        // --- 增量调用onChunk ---
 
-        // 1. Reasoning Content
+        // 1. 推理内容
         const reasoningContent = delta?.reasoning_content || delta?.reasoning
-        const currentTime = new Date().getTime() // Get current time for each chunk
+        // 获取当前时间
+        const currentTime = new Date().getTime()
 
         if (time_first_token_millsec === 0 && isFirstThinkingChunk && reasoningContent) {
           // 记录第一个token的时间
@@ -567,11 +632,14 @@ export default class OpenAIProvider extends BaseProvider {
           isFirstThinkingChunk = false
         }
         if (reasoningContent) {
+          // 累积思考内容
           thinkingContent += reasoningContent
-          hasReasoningContent = true // Keep track if reasoning occurred
+          // 标记有推理内容
+          hasReasoningContent = true
 
-          // Calculate thinking time as time elapsed since start until this chunk
+          // 计算思考时间
           const thinking_time = currentTime - time_first_token_millsec
+          // 发送思考增量内容
           onChunk({ type: ChunkType.THINKING_DELTA, text: reasoningContent, thinking_millsec: thinking_time })
         }
 
@@ -579,6 +647,7 @@ export default class OpenAIProvider extends BaseProvider {
           if (time_first_content_millsec === 0) {
             time_first_content_millsec = currentTime
             final_time_thinking_millsec_delta = time_first_content_millsec - time_first_token_millsec
+            // 发送思考完成内容
             onChunk({
               type: ChunkType.THINKING_COMPLETE,
               text: thinkingContent,
@@ -591,16 +660,20 @@ export default class OpenAIProvider extends BaseProvider {
           }
         }
 
-        // 2. Text Content
+        // 2. 文本内容
         if (delta?.content) {
           if (assistant.enableWebSearch) {
             if (delta?.annotations) {
+              // 转换链接
               delta.content = convertLinks(delta.content || '', isFirstChunk)
             } else if (assistant.model?.provider === 'openrouter') {
+              // 转换OpenRouter链接
               delta.content = convertLinksToOpenRouter(delta.content || '', isFirstChunk)
             } else if (isZhipuModel(assistant.model)) {
+              // 转换智谱链接
               delta.content = convertLinksToZhipu(delta.content || '', isFirstChunk)
             } else if (isHunyuanSearchModel(assistant.model)) {
+              // 转换混元搜索链接
               delta.content = convertLinksToHunyuan(
                 delta.content || '',
                 chunk.search_info.search_results || [],
@@ -614,17 +687,15 @@ export default class OpenAIProvider extends BaseProvider {
             time_first_token_millsec = currentTime
             time_first_token_millsec_delta = time_first_token_millsec - start_time_millsec
           }
-          content += delta.content // Still accumulate for processToolUses
+          // 累积内容用于工具处理
+          content += delta.content
 
-          // isThinkingInContent = this.findThinkingProcessor(content, model)
-          // if (isThinkingInContent) {
-          //   processThinkingChunk(content, isThinkingInContent, onChunk)
+          // 发送文本增量内容
           onChunk({ type: ChunkType.TEXT_DELTA, text: delta.content })
-          // } else {
-          // }
         }
-        // console.log('delta?.finish_reason', delta?.finish_reason)
+        // 当完成原因不为空时
         if (!isEmpty(finishReason)) {
+          // 发送文本完成内容
           onChunk({ type: ChunkType.TEXT_COMPLETE, text: content })
           final_time_completion_millsec_delta = currentTime - start_time_millsec
           console.log(
@@ -638,16 +709,15 @@ export default class OpenAIProvider extends BaseProvider {
               fractionalSecondDigits: 3
             })}`
           )
-          // 6. Usage (If provided per chunk) - Capture the last known usage
+          // 6. Usage (如果每个chunk提供) - 捕获最后已知的usage
           if (chunk.usage) {
-            // console.log('chunk.usage', chunk.usage)
-            lastUsage = chunk.usage // Update with the latest usage info
-            // Send incremental usage update if needed by UI (optional, keep if useful)
-            // onChunk({ type: 'block_in_progress', response: { usage: chunk.usage } })
+            // 更新最后已知的usage信息
+            lastUsage = chunk.usage
           }
 
-          // 3. Web Search
+          // 3. 网络搜索
           if (delta?.annotations) {
+            // 发送OpenAI网络搜索完成内容
             onChunk({
               type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
               llm_web_search: {
@@ -660,6 +730,7 @@ export default class OpenAIProvider extends BaseProvider {
           if (assistant.model?.provider === 'perplexity') {
             const citations = chunk.citations
             if (citations) {
+              // 发送Perplexity网络搜索完成内容
               onChunk({
                 type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
                 llm_web_search: {
@@ -670,6 +741,7 @@ export default class OpenAIProvider extends BaseProvider {
             }
           }
           if (isEnabledWebSearch && isZhipuModel(model) && finishReason === 'stop' && chunk?.web_search) {
+            // 发送智谱网络搜索完成内容
             onChunk({
               type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
               llm_web_search: {
@@ -679,6 +751,7 @@ export default class OpenAIProvider extends BaseProvider {
             } as LLMWebSearchCompleteChunk)
           }
           if (isEnabledWebSearch && isHunyuanSearchModel(model) && chunk?.search_info?.search_results) {
+            // 发送混元网络搜索完成内容
             onChunk({
               type: ChunkType.LLM_WEB_SEARCH_COMPLETE,
               llm_web_search: {
@@ -689,21 +762,20 @@ export default class OpenAIProvider extends BaseProvider {
           }
         }
 
-        // --- End of Incremental onChunk calls ---
-      } // End of for await loop
+        // --- 增量调用onChunk结束 ---
+      } // 结束for await循环
 
-      // Call processToolUses AFTER the loop finishes processing the main stream content
-      // Note: parseAndCallTools inside processToolUses should handle its own onChunk for tool responses
+      // 在主流内容处理完成后调用processToolUses
       await processToolUses(content, idx)
 
-      // Send the final block_complete chunk with accumulated data
+      // 发送最终的block_complete chunk
       onChunk({
         type: ChunkType.BLOCK_COMPLETE,
         response: {
-          // Use the enhanced usage object
+          // 使用增强的usage对象
           usage: lastUsage,
           metrics: {
-            // Get completion tokens from the last usage object if available
+            // 从最后一个usage对象获取完成令牌数
             completion_tokens: lastUsage?.completion_tokens,
             time_completion_millsec: final_time_completion_millsec_delta,
             time_first_token_millsec: time_first_token_millsec_delta,
@@ -718,10 +790,12 @@ export default class OpenAIProvider extends BaseProvider {
     }
 
     console.debug('[completions] reqMessages before processing', model.id, reqMessages)
+    // 处理请求消息
     reqMessages = processReqMessages(model, reqMessages)
     console.debug('[completions] reqMessages', model.id, reqMessages)
     // 等待接口返回流
     onChunk({ type: ChunkType.LLM_RESPONSE_CREATED })
+    // 发起流式请求
     const stream = await this.sdk.chat.completions
       // @ts-ignore key is not typed
       .create(
@@ -744,6 +818,7 @@ export default class OpenAIProvider extends BaseProvider {
         }
       )
 
+    // 处理流式响应并在完成后执行清理操作
     await processStream(stream, 0).finally(cleanup)
 
     // 捕获signal的错误

@@ -196,20 +196,36 @@ export function withGenerateImage(message: Message): { content: string; images?:
   return { content: originalContent }
 }
 
+/**
+ * 将生成的图片文件添加到消息内容中。
+ * 该函数会查找最后一条助手消息，若其中包含生成图片的元数据，
+ * 则将这些图片文件信息添加到该助手消息的 `images` 属性中。
+ *
+ * @param messages - 消息数组，包含多个消息对象。
+ * @returns 更新后的消息数组，若有符合条件的图片文件，对应助手消息会添加 `images` 属性。
+ */
 export function addImageFileToContents(messages: Message[]) {
+  // 查找消息数组中最后一条角色为 'assistant' 的消息
   const lastAssistantMessage = messages.findLast((m) => m.role === 'assistant')
+  // 若未找到最后一条助手消息，直接返回原始消息数组
   if (!lastAssistantMessage) return messages
+  // 从最后一条助手消息中查找图片块
   const blocks = findImageBlocks(lastAssistantMessage)
+  // 若未找到图片块或图片块数量为 0，直接返回原始消息数组
   if (!blocks || blocks.length === 0) return messages
+  // 检查所有图片块的元数据中是否都不包含生成图片信息，若是则直接返回原始消息数组
   if (blocks.every((v) => !v.metadata?.generateImage)) {
     return messages
   }
 
+  // 从图片块的元数据中提取生成的图片文件信息，并将其展平为一维数组
   const imageFiles = blocks.map((v) => v.metadata?.generateImage?.images).flat()
+  // 创建一个新的助手消息对象，复制最后一条助手消息的属性，并添加图片文件信息到 `images` 属性
   const updatedAssistantMessage = {
     ...lastAssistantMessage,
     images: imageFiles
   }
 
+  // 遍历消息数组，将最后一条助手消息替换为更新后的助手消息，其他消息保持不变
   return messages.map((message) => (message.id === lastAssistantMessage.id ? updatedAssistantMessage : message))
 }

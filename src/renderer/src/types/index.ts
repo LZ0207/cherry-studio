@@ -153,7 +153,7 @@ export type Provider = {
   isSystem?: boolean
   isAuthed?: boolean
   rateLimit?: number
-  isNotSupportArrayContent?: boolean
+  isNotSupportArrayContent?: boolean // 不支持数组内容
   notes?: string
 }
 

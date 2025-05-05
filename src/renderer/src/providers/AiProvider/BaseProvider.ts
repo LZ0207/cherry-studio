@@ -165,19 +165,31 @@ export default abstract class BaseProvider {
     return []
   }
 
+  /**
+   * 从助手设置中获取自定义参数对象。
+   *
+   * @param assistant - 助手对象，包含设置信息。
+   * @returns 包含自定义参数的对象，如果没有有效参数则返回空对象。
+   */
   protected getCustomParameters(assistant: Assistant) {
+    // 使用 reduce 方法遍历助手设置中的自定义参数数组，将其转换为对象
     return (
       assistant?.settings?.customParameters?.reduce((acc, param) => {
+        // 检查参数名称是否为空或仅包含空白字符，如果是则跳过该参数
         if (!param.name?.trim()) {
           return acc
         }
+        // 处理类型为 'json' 的参数
         if (param.type === 'json') {
           const value = param.value as string
+          // 如果参数值为 'undefined'，则将对应属性值设为 undefined
           if (value === 'undefined') {
             return { ...acc, [param.name]: undefined }
           }
+          // 检查参数值是否为有效的 JSON 字符串，如果是则解析为对象，否则保持原值
           return { ...acc, [param.name]: isJSON(value) ? parseJSON(value) : value }
         }
+        // 处理非 'json' 类型的参数，直接将参数名和值添加到结果对象中
         return {
           ...acc,
           [param.name]: param.value
